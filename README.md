@@ -19,7 +19,3 @@ This is the simulation code for performing ADAPT-VQE calculations. Method detail
 3. Install
 
         pip install .
-
-4. run tests
-    
-        pytest test/*.py
