@@ -1,4 +1,3 @@
-
 import scipy
 import openfermion
 import openfermionpsi4
@@ -10,7 +9,7 @@ import sys
 
 import pyscf
 from pyscf import lib
-from pyscf import gto, scf, mcscf, fci, ao2mo, lo, molden, cc
+from pyscf import gto, scf, mcscf, fci, ao2mo, lo, cc
 from pyscf.cc import ccsd
 
 import operator_pools
@@ -18,20 +17,22 @@ import vqe_methods
 from tVQE import *
 
 from openfermion import *
+from openfermion.linalg import *
 
+import csv
 
 import pyscf_helper
 
-def adapt_vqe(hamiltonian_op, pool, reference_ket,
+def adapt_vqe(hamiltonian_op, pool, reference_ket, filenam,
         adapt_conver    = 'norm',
         adapt_thresh    = 1e-3,
         theta_thresh    = 1e-7,
-        adapt_maxiter   = 200,
+        adapt_maxiter   = 30,
         psi4_filename   = "psi4_%12.12f"%random.random()
         ):
 # {{{
 
-    hamiltonian = openfermion.transforms.get_sparse_operator(hamiltonian_op)
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
     ref_energy = reference_ket.T.conj().dot(hamiltonian.dot(reference_ket))[0,0].real
     print(" Reference Energy: %12.8f" %ref_energy)
 
@@ -41,12 +42,21 @@ def adapt_vqe(hamiltonian_op, pool, reference_ket,
     pool.generate_SparseMatrix()
     pool.gradient_print_thresh = theta_thresh
 
+    [e,v] = scipy.sparse.linalg.eigsh(hamiltonian.real,1,which='SA',v0=reference_ket.todense())
+    for ei in range(len(e)):
+        targetstate = v[:,ei]
+
+    [e,v] = scipy.sparse.linalg.eigsh(hamiltonian.real,10,which='SA',v0=reference_ket.todense())
+    for ei in range(len(e)):
+        print(ei, e[ei])
+
     ansatz_ops = []     #SQ operator strings in the ansatz
     ansatz_mat = []     #Sparse Matrices for operators in ansatz
 
     print(" Start ADAPT-VQE algorithm")
     op_indices = []
     parameters = []
+    energy_list = []
     curr_state = 1.0*reference_ket
 
     print(" Now start to grow the ansatz")
@@ -65,11 +75,11 @@ def adapt_vqe(hamiltonian_op, pool, reference_ket,
         print(" Measure Operator Pool Gradients:")
         sig = hamiltonian.dot(curr_state)
         e_curr = curr_state.T.conj().dot(sig)[0,0]
-        var = sig.T.conj().dot(sig)[0,0] - e_curr**2
-        uncertainty = np.sqrt(var.real)
-        assert(np.isclose(var.imag,0))
-        print(" Variance:    %12.8f" %var.real)
-        print(" Uncertainty: %12.8f" %uncertainty)
+        # var = sig.T.conj().dot(sig)[0,0] - e_curr**2
+        # uncertainty = np.sqrt(var.real)
+        # assert(np.isclose(var.imag,0))
+        # print(" Variance:    %12.8f" %var.real)
+        # print(" Uncertainty: %12.8f" %uncertainty)
         for oi in range(pool.n_ops):
 
             gi = pool.compute_gradient_i(oi, curr_state, sig)
@@ -117,19 +127,125 @@ def adapt_vqe(hamiltonian_op, pool, reference_ket,
 
         trial_model = tUCCSD(hamiltonian, ansatz_mat, reference_ket, parameters)
 
+        # opt_result = scipy.optimize.minimize(trial_model.energy, parameters, jac=trial_model.gradient,
+        #         options = min_options, method = 'BFGS', callback=trial_model.callback)
 
-        opt_result = scipy.optimize.minimize(trial_model.energy, parameters, jac=trial_model.gradient,
-                options = min_options, method = 'BFGS', callback=trial_model.callback)
+        opt_result = scipy.optimize.minimize(trial_model.energy, parameters, method = 'BFGS', callback=trial_model.callback)
+        print("nfev:",opt_result.nfev,"njev:",opt_result.njev)
+
+        energy_list.append([trial_model.energy(parameters), opt_result.nfev, opt_result.njev])
 
         parameters = list(opt_result['x'])
         curr_state = trial_model.prepare_state(parameters)
+        innerprod = abs(curr_state.T.conj().dot(targetstate))**2
         print(" Finished: %20.12f" % trial_model.curr_energy)
+        print(" Overlap: %20.12f" % innerprod)
         print(" -----------New ansatz----------- ")
         print(" %4s %12s %18s" %("#","Coeff","Term"))
         for si in range(len(ansatz_ops)):
             opstring = pool.get_string_for_term(ansatz_ops[si])
             print(" %4i %12.8f %s" %(si, parameters[si], opstring) )
-    return trial_model.curr_energy, curr_state, parameters
+
+    filename = filenam
+
+    with open(filename, 'w', newline= "" ) as file:
+        csvwriter = csv.writer(file)
+        csvwriter.writerows(energy_list)
+
+    return trial_model.curr_energy, curr_state
+# }}}
+
+def FQA(hamiltonian_op, pool, reference_ket, filenam, one_body, two_body,
+        adapt_conver    = 'norm',
+        adapt_thresh    = 1e-3,
+        theta_thresh    = 1e-7,
+        adapt_maxiter   = 500,
+        psi4_filename   = "psi4_%12.12f"%random.random(),
+        learningrate   = 0.1,
+        slow_down       = False
+        ):
+# {{{
+
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
+    ref_energy = reference_ket.T.conj().dot(hamiltonian.dot(reference_ket))[0,0].real
+    print(" Reference Energy: %12.8f" %ref_energy)
+
+    #Thetas
+    parameters = []
+    energy_list = []
+
+    pool.generate_SparseMatrix()
+    pool.gradient_print_thresh = theta_thresh
+
+    ansatz_ops = []     #SQ operator strings in the ansatz
+    ansatz_mat = []     #Sparse Matrices for operators in ansatz
+
+    print(" Start ADAPT-VQE algorithm")
+    op_indices = []
+    parameters = []
+    curr_state = 1.0*reference_ket
+
+    print(" Now start to grow the ansatz")
+    for n_iter in range(0,adapt_maxiter):
+
+        print("\n\n\n")
+        print(" --------------------------------------------------------------------------")
+        print("                         ADAPT-VQE iteration: ", n_iter)
+        print(" --------------------------------------------------------------------------")
+        next_index = None
+        next_deriv = 0
+        curr_norm = 0
+
+        print(" Check each new operator for coupling")
+        next_term = []
+        print(" Measure Operator Pool Gradients:")
+
+        ham_norm = np.linalg.norm((hamiltonian).todense(), ord = 2)
+        new_norm = np.linalg.norm((one_body).todense(), ord = 2)
+        # learning_rate = 1/4/ham_norm/new_norm
+        # learning_rate = 0.05
+        learning_rate = learningrate
+        print('step_size', learning_rate)
+
+        parameters.insert(0,-1j*learning_rate)
+        ansatz_mat.insert(0,hamiltonian)
+
+        sig = hamiltonian.dot(curr_state)
+
+        opA = one_body
+        v = curr_state
+
+        gi = v.transpose().conj().dot(opA.dot(sig)) - sig.transpose().conj().dot(opA.dot(v))
+        assert(gi.shape == (1,1))
+        gi = gi[0,0]
+        print(gi)
+        gi = gi.imag
+
+        parameters.insert(0,-1j*learning_rate*gi)
+        ansatz_mat.insert(0,one_body)
+
+        trial_model = tUCCSD(hamiltonian, ansatz_mat, reference_ket, parameters, sig)
+
+        energy_list.append([trial_model.energy(parameters)])
+
+        curr_state = trial_model.prepare_state(parameters)
+        print(" Finished: %20.12f" % trial_model.energy(parameters))
+        print(" -----------New ansatz----------- ")
+        print(" %4s %12s %18s" %("#","Coeff","Term"))
+        for si in range(len(ansatz_ops)):
+            opstring = pool.get_string_for_term(ansatz_ops[si])
+            print(" %4i %12.8f %s" %(si, parameters[si], opstring) )        
+        if slow_down:
+            learning_rate = learning_rate * 0.99
+
+    filename = filenam
+
+    with open(filename, 'w', newline= "" ) as file:
+        csvwriter = csv.writer(file)
+        csvwriter.writerows(energy_list)
+
+
+    return trial_model.energy(parameters), curr_state
 
 # }}}
 
@@ -169,7 +285,7 @@ def ucc(geometry,
 
     #JW transform Hamiltonian computed classically with OFPsi4
     hamiltonian_op = molecule.get_molecular_hamiltonian()
-    hamiltonian = openfermion.transforms.get_sparse_operator(hamiltonian_op)
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
 
     #Thetas
     parameters = [0]*pool.n_ops
@@ -230,7 +346,7 @@ def test_random(geometry,
 
     #JW transform Hamiltonian computed classically with OFPsi4
     hamiltonian_op = molecule.get_molecular_hamiltonian()
-    hamiltonian = openfermion.transforms.get_sparse_operator(hamiltonian_op)
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
 
     #Thetas
     parameters = []
@@ -380,7 +496,7 @@ def test_lexical(geometry,
 
     #JW transform Hamiltonian computed classically with OFPsi4
     hamiltonian_op = molecule.get_molecular_hamiltonian()
-    hamiltonian = openfermion.transforms.get_sparse_operator(hamiltonian_op)
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
 
     #Thetas
     parameters = []
@@ -495,7 +611,7 @@ def seqGO(hamiltonian_op, pool, reference_ket,
         theta_thresh    = 1e-7,
         psi4_filename   = "psi4_%12.12f"%random.random()
         ):
-    hamiltonian = openfermion.transforms.get_sparse_operator(hamiltonian_op)
+    hamiltonian = openfermion.linalg.get_sparse_operator(hamiltonian_op)
     ref_energy = reference_ket.T.conj().dot(hamiltonian.dot(reference_ket))[0,0].real
     print(" Reference Energy: %12.8f" %ref_energy)
 
@@ -713,7 +829,7 @@ if __name__== "__main__":
 
     fermi_ham  = sq_ham.export_FermionOperator()
 
-    hamiltonian = openfermion.transforms.get_sparse_operator(fermi_ham)
+    hamiltonian = openfermion.linalg.get_sparse_operator(fermi_ham)
 
     s2 = Make_S2(n_orb)
 
@@ -732,7 +848,6 @@ if __name__== "__main__":
         S2 = v[:,ei].conj().T.dot(s2.dot(v[:,ei]))
         print(" State %4i: %12.8f au  <S2>: %12.8f" %(ei,e[ei]+E_nuc,S2))
     fermi_ham += FermionOperator((),E_nuc)
-    pyscf.molden.from_mo(mol, "full.molden", sq_ham.C)
 
     pool = operator_pools.singlet_SD()
     pool.init(n_orb, n_occ_a=n_a, n_occ_b=n_b, n_vir_a=n_orb-n_a, n_vir_b=n_orb-n_b)
